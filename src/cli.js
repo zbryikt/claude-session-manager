@@ -1,18 +1,19 @@
 /** ccs — Claude Code session 總覽 / 摘要 / 統計 / 備份。 */
 import { readdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { connect } from './db.js';
 import * as scan from './scan.js';
 import * as summarize from './summarize.js';
 import * as backupMod from './backup.js';
 import * as snapshot from './snapshot.js';
+import * as search from './search.js';
 import { pathLabel } from './pathlabel.js';
 import { ago, human, lpad, pad, trunc, width } from './util.js';
 
 const SESSIONS_DIR = join(homedir(), '.claude/sessions');
-const COMMANDS = ['ls', 'sum', 'sync', 'stats', 'resume', 'backup', 'snap', 'snaps', 'restore', 'help'];
+const COMMANDS = ['ls', 'sum', 'sync', 'stats', 'resume', 'backup', 'snap', 'snaps', 'restore', 'grep', 'who', 'help'];
 const NO_SCAN = ['snap', 'snaps', 'restore'];   // 只看目前開著的 session 與快照，不需要 transcript
 
 /**
@@ -364,6 +365,101 @@ function cmdRestore(db, opts) {
   if (!opts.dryRun) snapshot.openTabs(open.map((i) => i.cmd));
 }
 
+/** session 的顯示資訊；opts.sdk 沒開時濾掉 claude -p 自己留下的。 */
+function sessionInfo(db, opts) {
+  const alive = liveSessions();
+  const map = new Map(db.prepare('SELECT sid, name, label, cwd, kind FROM sessions').all()
+    .map((s) => [s.sid, { ...s, name: alive.get(s.sid)?.name ?? s.name, label: s.label ?? pathLabel(s.cwd) }]));
+  return { info: (sid) => map.get(sid) ?? {}, keep: (sid) => opts.sdk || map.get(sid)?.kind !== 'sdk' };
+}
+
+function openIndex(opts) {
+  const idx = search.connect(opts.dbPath);
+  search.sync(idx, { rescan: opts.rescan, verbose: opts.verbose });
+  return idx;
+}
+
+const shown = (rows, opts) => {
+  const out = opts.all ? rows : rows.slice(0, opts.n);
+  return opts.reverse ? [...out].reverse() : out;
+};
+const termWidth = () => (process.stdout.columns > 60 ? process.stdout.columns - 1 : 118);
+const HIT_ROLE = { user: '你', assistant: '助理' };
+
+function cmdGrep(db, opts) {
+  const terms = opts.pos;
+  if (!terms.length) throw new Error('要指定關鍵字：ccs grep <關鍵字...>');
+  const idx = openIndex(opts);
+  try {
+    const { info, keep } = sessionInfo(db, opts);
+    const all = search.grep(idx, terms).filter((r) => keep(r.sid));
+    if (!all.length) return console.log('沒有找到');
+    const rows = shown(all, opts).map((r) => {
+      const hit = search.firstHit(idx, terms, r.sid);
+      return { ...r, ...info(r.sid), sid: r.sid, by: HIT_ROLE[hit.role] ?? hit.tool, text: search.snippet(hit.body, terms) };
+    });
+    renderTable(`提到 ${terms.join(' + ')} 的 session`, [
+      { head: '最早', w: 16, align: 'l', get: (r) => fmtTime(r.first) },
+      { head: '最近', w: 16, align: 'l', get: (r) => fmtTime(r.last) },
+      { head: '次數', w: 4, align: 'r', get: (r) => r.n },
+      { head: 'NAME', w: 20, align: 'l', get: (r) => r.name ?? r.label },
+      { head: 'SID', w: 8, align: 'l', get: (r) => r.sid.slice(0, 8) },
+      { head: '來源', w: 6, align: 'l', get: (r) => r.by },
+      { head: '最早一則', w: Math.max(20, termWidth() - 78), align: 'l', get: (r) => r.text },
+    ], rows);
+    console.log(`\n共 ${all.length} 個 session，顯示 ${rows.length} 筆`);
+  } finally {
+    idx.close();
+  }
+}
+
+function cmdWho(db, opts) {
+  const target = resolve(opts.pos[0] ?? '.');
+  const idx = openIndex(opts);
+  try {
+    const { info, keep } = sessionInfo(db, opts);
+    const ops = search.ops(idx, target).filter((o) => keep(o.sid));
+    if (!ops.length) return console.log(`沒有 session 動過 ${shortPath(target)}`);
+    const label = (sid) => info(sid).name ?? info(sid).label ?? sid.slice(0, 8);
+
+    if (opts.verbose) {
+      for (const o of shown(ops, opts)) {
+        const rel = relative(target, o.path) || '.';
+        console.log(`${fmtTime(o.ts)} ${o.action === 'write' ? '寫' : '讀'} ${pad(o.tool, 12)} ${pad(trunc(label(o.sid), 20), 20)} ${rel}` +
+                    `${o.detail ? `  ← ${trunc(o.detail.replace(/\s+/g, ' '), 80)}` : ''}`);
+      }
+      return console.log(`\n共 ${ops.length} 筆操作`);
+    }
+
+    const bySid = new Map();
+    for (const o of ops) {
+      const r = bySid.get(o.sid) ?? { sid: o.sid, first: o.ts, last: o.ts, w: 0, r: 0 };
+      r.last = o.ts;
+      r[o.action === 'write' ? 'w' : 'r']++;
+      bySid.set(o.sid, r);
+    }
+    const all = [...bySid.values()];
+    const rows = shown(all, opts).map((r) => ({ ...r, ...info(r.sid), sid: r.sid }));
+    const firstWrite = ops.find((o) => o.action === 'write');
+    renderTable(`動過 ${shortPath(target)} 的 session（最早的在前）`, [
+      { head: '最早', w: 16, align: 'l', get: (r) => fmtTime(r.first) },
+      { head: '最近', w: 16, align: 'l', get: (r) => fmtTime(r.last) },
+      { head: '寫', w: 5, align: 'r', get: (r) => r.w },
+      { head: '讀', w: 5, align: 'r', get: (r) => r.r },
+      { head: 'NAME', w: 24, align: 'l', get: (r) => r.name ?? r.label },
+      { head: 'SID', w: 8, align: 'l', get: (r) => r.sid.slice(0, 8) },
+      { head: 'CWD', w: Math.max(20, termWidth() - 80), align: 'l', get: (r) => shortPath(r.cwd) },
+    ], rows);
+    console.log(`\n共 ${all.length} 個 session，${ops.length} 筆操作（-v 看逐筆）`);
+    if (firstWrite) {
+      console.log(`最早寫入：${fmtTime(firstWrite.ts)} ${label(firstWrite.sid)}（${firstWrite.tool}）` +
+                  ` ${relative(target, firstWrite.path) || '.'}`);
+    }
+  } finally {
+    idx.close();
+  }
+}
+
 async function cmdBackup(db, opts) {
   if (opts.show) {
     const d = backupMod.showDest(db);
@@ -406,6 +502,10 @@ const HELP = `ccs — Claude Code session 總覽
   ccs snaps rm <id|名稱>   刪除快照
   ccs restore [id|名稱]    每個 session 開一個分頁 resume，已在執行的跳過（預設最近一筆）
   ccs restore --dry-run    只印出會做什麼
+
+  ccs grep <關鍵字...>      全文搜尋所有 session（prompt、助理文字、工具輸入），多個詞是 AND
+  ccs who [路徑]           哪些 session 動過這個路徑（含底下的檔案，預設目前目錄）；-v 看逐筆
+                           第一次要建索引，約一分鐘；--rescan 重建
 
   ccs backup gs://bucket/path/   備份 transcript 與資料庫到 GCS（會記住目的地）
   ccs backup                     用記住的目的地再備份一次
@@ -473,7 +573,7 @@ async function main() {
     cols: disp.cols ?? DEFAULT_COLS, sort: disp.sort,
     model: v.model, workers: Number(v.workers), verbose: v.verbose,
     dryRun: v['dry-run'], dbOnly: v['db-only'], show: v.show,
-    sdk: v.sdk, rescan: v.rescan, pos, force: v.force,
+    sdk: v.sdk, rescan: v.rescan, pos, force: v.force, dbPath: v.db,
   };
 
   try {
@@ -486,6 +586,8 @@ async function main() {
     else if (cmd === 'snap') cmdSnap(db, opts);
     else if (cmd === 'snaps') cmdSnaps(db, opts);
     else if (cmd === 'restore') cmdRestore(db, opts);
+    else if (cmd === 'grep') cmdGrep(db, opts);
+    else if (cmd === 'who') cmdWho(db, opts);
   } catch (e) {
     console.error(`\n${e.message}`);
     process.exit(1);

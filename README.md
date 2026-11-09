@@ -214,6 +214,20 @@ ccs restore 3 --dry-run
 
 已在執行的 session 會跳過，重複還原不會開出重複的分頁。分頁依名稱排序；背景 agent（`kind: bg`）還原後會變成一般 session。
 
+## 搜尋
+
+```bash
+ccs grep autoops         # 哪些 session 提過；多個詞是 AND
+ccs who ~/some/project   # 哪些 session 動過這個路徑（含底下的檔案），最早的在前
+ccs who . -v             # 逐筆列出操作
+```
+
+索引放在 `~/.local/state/ccstat/search.db`（約 400 MB，第一次建約 40 秒，之後增量）。它能從 transcript 重建，所以不備份；`--rescan` 可重建。
+
+只收 prompt、助理文字和工具輸入，子代理的內容算在父 session。**不收 tool_result**，所以只出現在指令輸出裡的字搜不到。
+
+`ccs who` 的 Write、Edit、Read 是精確的；Bash 指令則是從文字估路徑（`cd x && git init`、`mkdir`、`mv`、重導向等），看不到變數展開與 `python -c` 裡的路徑。session 以外的操作（你自己在終端機做的）不會出現。
+
 ## 資料來源
 
 | 來源 | 性質 | 用途 |

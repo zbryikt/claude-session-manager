@@ -17,10 +17,10 @@ import { pathLabel } from './pathlabel.js';
 
 export const PROJECTS = join(homedir(), '.claude/projects');
 
-const SKIP_PREFIX = ['<task-notification>', '<local-command', '<system-reminder>'];
+export const SKIP_PREFIX = ['<task-notification>', '<local-command', '<system-reminder>'];
 
-/** 所有 transcript 路徑；子代理的紀錄不是獨立 session，略過。 */
-export function listTranscripts(root = PROJECTS) {
+/** 所有 transcript 路徑；子代理的紀錄不是獨立 session，統計時略過。 */
+export function listTranscripts(root = PROJECTS, { subagents = false } = {}) {
   let entries;
   try {
     entries = readdirSync(root, { recursive: true, withFileTypes: true });
@@ -30,7 +30,7 @@ export function listTranscripts(root = PROJECTS) {
   return entries
     .filter((e) => e.isFile() && e.name.endsWith('.jsonl'))
     .map((e) => join(e.parentPath ?? e.path, e.name))
-    .filter((p) => !p.split(sep).includes('subagents'));
+    .filter((p) => subagents || !p.split(sep).includes('subagents'));
 }
 
 /** 把 message.content 攤成純文字，丟掉 tool_use / tool_result 區塊。 */
@@ -42,7 +42,7 @@ export function textOf(content) {
   return '';
 }
 
-function tsOf(rec) {
+export function tsOf(rec) {
   if (!rec.timestamp) return null;
   const ms = Date.parse(rec.timestamp);
   return Number.isNaN(ms) ? null : ms / 1000;
