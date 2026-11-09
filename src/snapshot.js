@@ -16,6 +16,7 @@ const INTERVAL_SEC = 300;
 const LABEL = 'com.zbryikt.ccs-snap';
 const PLIST = join(homedir(), 'Library/LaunchAgents', `${LABEL}.plist`);
 const LOG = join(homedir(), '.local/state/ccstat/snap.log');
+const PROJECTS = join(homedir(), '.claude/projects');
 
 // 用 argv 傳指令，省掉 AppleScript 字串跳脫
 const OPEN_TABS = `
@@ -38,10 +39,14 @@ on run argv
 end run
 `;
 
+/** daemon 預先開的 bg session 還沒對話就沒有 transcript，resume 會失敗。 */
+const hasTranscript = (i) => existsSync(join(PROJECTS, i.cwd.replace(/[^A-Za-z0-9]/g, '-'), `${i.sid}.jsonl`));
+
 function liveItems(live) {
   return [...live]
     .filter(([, s]) => SNAP_KINDS.includes(s.kind) && s.cwd)
     .map(([sid, s]) => ({ sid, name: s.name ?? null, cwd: s.cwd, kind: s.kind }))
+    .filter(hasTranscript)
     .sort((a, b) => a.sid.localeCompare(b.sid));
 }
 
@@ -152,16 +157,18 @@ function hasAgentsViewer() {
 
 /** 算出還原要做的事，不動手。 */
 export function plan(snap, live) {
-  const open = [], running = [], missing = [];
+  const open = [], running = [], missing = [], empty = [];
   for (const i of snap.items) {
     if (live.has(i.sid)) running.push(i);
     else if (!existsSync(i.cwd)) missing.push(i);
+    else if (!hasTranscript(i)) empty.push(i);
     else open.push({ ...i, cmd: `${setTitle(i.name)}cd ${shq(i.cwd)} && claude --resume ${i.sid}` });
   }
-  const bg = running.find((i) => i.kind === 'bg');
+  // 看現在的狀態：快照時是 bg，resume 過就變成一般 session 了
+  const bg = running.find((i) => live.get(i.sid).kind === 'bg');
   const viewer = bg && !hasAgentsViewer()
     ? { ...bg, name: 'claude agents', cmd: `cd ${shq(bg.cwd)} && claude agents` } : null;
-  return { open: viewer ? [...open, viewer] : open, running, missing };
+  return { open: viewer ? [...open, viewer] : open, running, missing, empty };
 }
 
 export function openTabs(cmds) {

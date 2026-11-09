@@ -2,6 +2,9 @@
 
 ## master
 
+ - bug fix:
+   - skip sessions without a transcript in snapshots and restore
+   - don't open `claude agents` for a once-background session that is no longer one
  - tweaks:
    - rename project to `claude-session-manager` ( the command stays `ccs` )
  - features:

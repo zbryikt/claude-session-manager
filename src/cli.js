@@ -354,10 +354,11 @@ function cmdSnaps(db, opts) {
 function cmdRestore(db, opts) {
   const snap = snapshot.find(db, opts.pos[0]);
   const live = liveSessions();
-  const { open, running, missing } = snapshot.plan(snap, live);
+  const { open, running, missing, empty } = snapshot.plan(snap, live);
   console.log(`還原快照 #${snap.id}${snap.name ? `「${snap.name}」` : ''}（${fmtTime(snap.last_seen)}）`);
   for (const i of running) console.log(`  跳過（已在執行）  ${itemName(i)}`);
   for (const i of missing) console.log(`  跳過（目錄不存在）${itemName(i)}  ${shortPath(i.cwd)}`);
+  for (const i of empty) console.log(`  跳過（沒有對話紀錄）${itemName(i)}`);
   for (const i of open) console.log(`  ${opts.dryRun ? '會開啟' : '開啟'}  ${itemName(i)}${opts.dryRun ? `\n    ${i.cmd}` : ''}`);
   if (!open.length) return console.log('沒有需要開啟的 session');
   if (!opts.dryRun) snapshot.openTabs(open.map((i) => i.cmd));
