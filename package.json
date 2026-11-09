@@ -1,5 +1,5 @@
 {
-  "name": "claude-code-session-statistics",
+  "name": "claude-session-manager",
   "version": "0.3.0",
   "description": "盤點 Claude Code 的所有 session：狀態、LLM 摘要、token 用量統計、備份",
   "type": "module",
@@ -17,7 +17,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/zbryikt/claude-code-session-statistics.git"
+    "url": "git+https://github.com/zbryikt/claude-session-manager.git"
   },
   "volta": {
     "node": "22.23.1"
