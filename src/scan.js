@@ -7,6 +7,8 @@
  *
  * 唯一要防的是檔案被改寫（長度變短）：這時 offset 失效，整檔重讀。
  */
+import { readFileSync } from 'node:fs';
+import { getConfig, setConfig } from './db.js';
 import { readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join, sep } from 'node:path';
@@ -92,6 +94,7 @@ export function scanFile(db, path) {
   // --no-session-persistence 從源頭關掉，這裡再認一次當防呆：舊資料、
   // 或別處跑的 headless 呼叫，都會被標成 sdk 而不混進列表與統計。
   let kind = null;
+  let name = null;
   const usageRows = [];
 
   for (const line of lines) {
@@ -106,6 +109,7 @@ export function scanFile(db, path) {
     }
 
     if (rec.entrypoint === 'sdk-cli' || rec.promptSource === 'sdk') kind = 'sdk';
+    if (rec.type === 'custom-title') name = rec.customTitle || name;
 
     if (rec.type === 'user') {
       cwd = rec.cwd || cwd;
@@ -144,8 +148,8 @@ export function scanFile(db, path) {
 
   db.prepare(`
     INSERT INTO sessions (sid, path, cwd, project, label, branch, started_at, last_at,
-                          n_user, n_assistant, last_prompt, kind)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                          n_user, n_assistant, last_prompt, kind, name)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(sid) DO UPDATE SET
       path=excluded.path,
       cwd=COALESCE(excluded.cwd, sessions.cwd),
@@ -158,9 +162,10 @@ export function scanFile(db, path) {
       n_user=sessions.n_user + excluded.n_user,
       n_assistant=sessions.n_assistant + excluded.n_assistant,
       last_prompt=COALESCE(excluded.last_prompt, sessions.last_prompt),
-      kind=CASE WHEN excluded.kind='sdk' THEN 'sdk' ELSE sessions.kind END
+      kind=CASE WHEN excluded.kind='sdk' THEN 'sdk' ELSE sessions.kind END,
+      name=COALESCE(excluded.name, sessions.name)
   `).run(sid, path, cwd, project, label, branch, started, last, nUser, nAsst, lastPrompt,
-         kind ?? 'interactive');
+         kind ?? 'interactive', name);
 
   if (usageRows.length) {
     const ins = db.prepare(`INSERT OR IGNORE INTO usage
@@ -176,6 +181,27 @@ export function scanFile(db, path) {
   `).run(path, sid, newOffset, statSync(path).mtimeMs / 1000, Math.floor(Date.now() / 1000));
 
   return lines.length;
+}
+
+/**
+ * 舊資料補上 name，只跑一次。掃描是增量的，已讀過的部分不會再看到 custom-title；
+ * 不用 --rescan，因為它會清掉 transcript 已被刪除的 session 的統計。
+ */
+export function backfillNames(db) {
+  if (getConfig(db, 'names_backfilled')) return;
+  const set = db.prepare('UPDATE sessions SET name=? WHERE sid=?');
+  db.exec('BEGIN');
+  for (const { sid, path } of db.prepare('SELECT sid, path FROM sessions WHERE path IS NOT NULL').all()) {
+    try {
+      const text = readFileSync(path, 'utf8');
+      const at = text.lastIndexOf('"type":"custom-title"');
+      if (at < 0) continue;
+      const rec = JSON.parse(text.slice(text.lastIndexOf('\n', at) + 1, text.indexOf('\n', at)));
+      if (rec.type === 'custom-title' && rec.customTitle) set.run(rec.customTitle, sid);
+    } catch { /* 檔案不見或那行不完整，略過 */ }
+  }
+  setConfig(db, 'names_backfilled', '1');
+  db.exec('COMMIT');
 }
 
 /** 掃過所有 transcript。回傳 { files, lines }。 */

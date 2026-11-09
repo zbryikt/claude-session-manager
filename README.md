@@ -115,9 +115,10 @@ ccs sync --rescan    # 清掉快取重新全掃（改過分類規則後用）
 | 3 | `PROJ` | 路徑摘要（見下） |
 | 4 | `LAST PROMPT` | 最後一句輸入 |
 | 5 | `SUMMARY` | LLM 摘要（在做什麼 / 下一步） |
+| 6 | `NAME` | `/rename` 取的名字 |
 
 ```bash
-ccs              # 預設 -c134
+ccs              # 預設 -c1634
 ccs -c35         # 只要路徑摘要與內容摘要
 ccs -c1345       # 加上完整路徑以外的全部
 ccs -c24         # 完整路徑 + 最後 prompt
@@ -194,6 +195,24 @@ gcloud config set project <你的專案>
 ```
 0 3 * * *  /path/to/ccs backup >/dev/null 2>&1
 ```
+
+## 快照與還原
+
+記下某個時間點有哪些 session 開著，之後可整批 resume。只照時間留紀錄，主動或意外關掉的 session 不做區分，由還原時選時間點。
+
+```bash
+ccs snap              # 存一份；內容沒變只更新「最後看到」
+ccs snap 週一進度     # 有名稱的永久保留，--force 覆蓋
+ccs snap install      # 用 launchd 每 5 分鐘自動存，自動快照保留 30 天
+ccs snap uninstall    # 移除自動快照
+ccs snaps             # 列出所有快照
+ccs snaps show 3      # 看細節（● 表示現在還開著）
+ccs snaps rm 週一進度 # 刪除
+ccs restore           # 還原最近一筆，每個 session 開一個 iTerm2 分頁
+ccs restore 3 --dry-run
+```
+
+已在執行的 session 會跳過，重複還原不會開出重複的分頁。分頁依名稱排序；背景 agent（`kind: bg`）還原後會變成一般 session。
 
 ## 資料來源
 

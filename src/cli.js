@@ -7,11 +7,13 @@ import { connect } from './db.js';
 import * as scan from './scan.js';
 import * as summarize from './summarize.js';
 import * as backupMod from './backup.js';
+import * as snapshot from './snapshot.js';
 import { pathLabel } from './pathlabel.js';
 import { ago, human, lpad, pad, trunc, width } from './util.js';
 
 const SESSIONS_DIR = join(homedir(), '.claude/sessions');
-const COMMANDS = ['ls', 'sum', 'sync', 'stats', 'resume', 'backup', 'help'];
+const COMMANDS = ['ls', 'sum', 'sync', 'stats', 'resume', 'backup', 'snap', 'snaps', 'restore', 'help'];
+const NO_SCAN = ['snap', 'snaps', 'restore'];   // 只看目前開著的 session 與快照，不需要 transcript
 
 /**
  * 可開關的欄位。# 與 STATUS 永遠顯示（沒有它們這張表就沒意義）。
@@ -23,8 +25,9 @@ const COLUMNS = {
   3: { name: 'label',   head: 'PROJ',        sort: (r) => r.label ?? '' },
   4: { name: 'prompt',  head: 'LAST PROMPT', sort: (r) => r.last_prompt ?? '' },
   5: { name: 'doing',   head: 'SUMMARY',     sort: (r) => r.doing ?? '' },
+  6: { name: 'name',    head: 'NAME',        sort: (r) => r.name ?? '' },
 };
-const DEFAULT_COLS = [1, 3, 4];
+const DEFAULT_COLS = [1, 6, 3, 4];
 
 /** 從 argv 抽出 -c1234 與 -s3+ 這種黏在一起的短旗標，其餘交給 parseArgs。 */
 function extractDisplayFlags(argv) {
@@ -34,16 +37,16 @@ function extractDisplayFlags(argv) {
   for (const a of argv) {
     let m = a.match(/^-c(.*)$/);
     if (m) {
-      if (!/^[1-5]+$/.test(m[1])) {
+      if (!/^[1-6]+$/.test(m[1])) {
         throw new Error(`-c 後面只能接 ${valid} 的組合，收到：${a}\n` +
-          `  1=閒置時間 2=完整路徑 3=路徑摘要 4=最後 prompt 5=內容摘要`);
+          `  1=閒置時間 2=完整路徑 3=路徑摘要 4=最後 prompt 5=內容摘要 6=名稱`);
       }
       cols = [...new Set(m[1].split('').map(Number))];
       continue;
     }
     m = a.match(/^-s(.*)$/);
     if (m) {
-      const mm = m[1].match(/^([1-5])([+-]?)$/);
+      const mm = m[1].match(/^([1-6])([+-]?)$/);
       if (!mm) {
         throw new Error(`-s 後面只能接 ${valid} 加上選用的 + / -，收到：${a}\n` +
           `  例：-s1（時間，新到舊）、-s3+（路徑摘要，A→Z）`);
@@ -57,7 +60,7 @@ function extractDisplayFlags(argv) {
 }
 
 /**
- * { sessionId: {pid, status} }，只含進程還活著的。
+ * { sessionId: {pid, status, name, cwd, kind} }，只含進程還活著的。
  * ~/.claude/sessions/<pid>.json 只反映當下（進程結束就清掉），所以它是
  * 「還開著嗎」的來源，歷史一律看 transcript。
  */
@@ -69,7 +72,7 @@ function liveSessions() {
     try {
       const d = JSON.parse(readFileSync(join(SESSIONS_DIR, name), 'utf8'));
       process.kill(d.pid, 0);                 // 探活，死了會丟例外
-      out.set(d.sessionId, { pid: d.pid, status: d.status ?? '?' });
+      out.set(d.sessionId, { pid: d.pid, status: d.status ?? '?', name: d.name ?? null, cwd: d.cwd, kind: d.kind });
     } catch { /* 進程沒了或檔案壞了，略過 */ }
   }
   return out;
@@ -84,7 +87,10 @@ function fetchRows(db, { pattern, live, limit, sort, sdk = false } = {}) {
     ORDER BY s.last_at DESC`).all();
 
   const alive = liveSessions();
-  rows = rows.map((r) => ({ ...r, live: alive.get(r.sid) ?? null, label: r.label ?? pathLabel(r.cwd) }));
+  rows = rows.map((r) => {
+    const live = alive.get(r.sid) ?? null;
+    return { ...r, live, name: live?.name ?? r.name, label: r.label ?? pathLabel(r.cwd) };
+  });
 
   if (sort) {
     // 明確指定排序時就純粹照該欄排，不再把執行中的挑到前面
@@ -103,7 +109,7 @@ function fetchRows(db, { pattern, live, limit, sort, sdk = false } = {}) {
   if (live) rows = rows.filter((r) => r.live);
   if (pattern) {
     const p = pattern.toLowerCase();
-    rows = rows.filter((r) => [r.cwd, r.label, r.last_prompt, r.doing]
+    rows = rows.filter((r) => [r.cwd, r.label, r.name, r.last_prompt, r.doing]
       .some((v) => (v ?? '').toLowerCase().includes(p)));
   }
   return limit ? rows.slice(0, limit) : rows;
@@ -130,6 +136,10 @@ function layout(cols, rows, total) {
   const w = { };
   let fixed = 3 + 1 + 8 + 1;                       // # 與 STATUS
   if (cols.includes(1)) { w.elapsed = 6; fixed += 7; }
+  if (cols.includes(6)) {
+    w.name = Math.min(24, Math.max(4, ...rows.map((r) => width(r.name))));
+    fixed += w.name + 1;
+  }
   if (cols.includes(3)) {
     w.label = Math.min(32, Math.max(4, ...rows.map((r) => width(r.label))));
     fixed += w.label + 1;
@@ -166,6 +176,7 @@ function cmdLs(db, opts) {
 
   const head = [`${'#'.padStart(3)}`, pad('STATUS', 8)];
   if (cols.includes(1)) head.push(pad(COLUMNS[1].head, w.elapsed));
+  if (cols.includes(6)) head.push(pad(COLUMNS[6].head, w.name));
   if (cols.includes(3)) head.push(pad(COLUMNS[3].head, w.label));
   if (cols.includes(2)) head.push(pad(COLUMNS[2].head, w.path));
   if (cols.includes(4)) head.push(pad(COLUMNS[4].head, w.prompt));
@@ -182,6 +193,7 @@ function cmdLs(db, opts) {
     const cells = [String(i + 1).padStart(3),
                    pad(r.live ? `● ${r.live.status}` : '· closed', 8)];
     if (cols.includes(1)) cells.push(pad(ago(r.last_at), w.elapsed));
+    if (cols.includes(6)) cells.push(pad(trunc(r.name, w.name), w.name));
     if (cols.includes(3)) cells.push(pad(trunc(r.label, w.label), w.label));
     if (cols.includes(2)) cells.push(pad(trunc(shortPath(r.cwd), w.path), w.path));
     if (cols.includes(4)) cells.push(pad(trunc(r.last_prompt, w.prompt), w.prompt));
@@ -288,6 +300,69 @@ function cmdResume(db, opts) {
   console.log(`cd ${r.cwd} && claude --resume ${r.sid}`);
 }
 
+function cmdSnap(db, opts) {
+  const [arg] = opts.pos;
+  if (arg === 'install') {
+    const { plist, intervalMin } = snapshot.install();
+    return console.log(`已設定每 ${intervalMin} 分鐘自動快照：${plist}`);
+  }
+  if (arg === 'uninstall') return console.log(`已移除自動快照：${snapshot.uninstall()}`);
+  const r = snapshot.take(db, liveSessions(), { name: arg ?? null, force: opts.force });
+  if (!r) return console.log('目前沒有開著的 session，沒有記錄');
+  console.log(r.changed ? `已存快照 #${r.id}（${r.n} 個 session）` : `內容沒變，沿用快照 #${r.id}（${r.n} 個 session）`);
+}
+
+function fmtTime(sec) {
+  const d = new Date(sec * 1000);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+const itemName = (i) => i.name ?? shortPath(i.cwd);
+
+function printSnap(snap, live) {
+  console.log(`快照 #${snap.id}${snap.name ? `「${snap.name}」` : '（自動）'}`);
+  console.log(`建立 ${fmtTime(snap.created_at)}，最後看到 ${fmtTime(snap.last_seen)}，${snap.items.length} 個 session\n`);
+  const w = Math.min(24, Math.max(...snap.items.map((i) => width(itemName(i)))));
+  for (const i of snap.items) {
+    const state = live.has(i.sid) ? '●' : '·';
+    console.log(`${state} ${pad(trunc(itemName(i), w), w)} ${pad(i.kind, 11)} ${i.sid.slice(0, 8)}  ${shortPath(i.cwd)}`);
+  }
+}
+
+function cmdSnaps(db, opts) {
+  const [sub, ref] = opts.pos;
+  if (sub === 'show') return printSnap(snapshot.find(db, ref), liveSessions());
+  if (sub === 'rm') {
+    if (ref === undefined) throw new Error('要指定快照的編號或名稱：ccs snaps rm <id|名稱>');
+    const s = snapshot.remove(db, ref);
+    return console.log(`已刪除快照 #${s.id}${s.name ? `「${s.name}」` : ''}`);
+  }
+  if (sub !== undefined) throw new Error(`不認識的子指令：${sub}（可用 show、rm）`);
+  const snaps = snapshot.list(db);
+  if (!snaps.length) return console.log('還沒有任何快照，跑 ccs snap 存一份');
+  renderTable('快照', [
+    { head: 'ID', w: 5, align: 'r', get: (s) => s.id },
+    { head: '名稱', w: 16, align: 'l', get: (s) => s.name ?? '(自動)' },
+    { head: '建立', w: 16, align: 'l', get: (s) => fmtTime(s.created_at) },
+    { head: '最後看到', w: 16, align: 'l', get: (s) => fmtTime(s.last_seen) },
+    { head: '數量', w: 4, align: 'r', get: (s) => s.items.length },
+    { head: 'SESSIONS', w: 50, align: 'l', get: (s) => s.items.map(itemName).join(', ') },
+  ], snaps);
+}
+
+function cmdRestore(db, opts) {
+  const snap = snapshot.find(db, opts.pos[0]);
+  const live = liveSessions();
+  const { open, running, missing } = snapshot.plan(snap, live);
+  console.log(`還原快照 #${snap.id}${snap.name ? `「${snap.name}」` : ''}（${fmtTime(snap.last_seen)}）`);
+  for (const i of running) console.log(`  跳過（已在執行）  ${itemName(i)}`);
+  for (const i of missing) console.log(`  跳過（目錄不存在）${itemName(i)}  ${shortPath(i.cwd)}`);
+  for (const i of open) console.log(`  ${opts.dryRun ? '會開啟' : '開啟'}  ${itemName(i)}${opts.dryRun ? `\n    ${i.cmd}` : ''}`);
+  if (!open.length) return console.log('沒有需要開啟的 session');
+  if (!opts.dryRun) snapshot.openTabs(open.map((i) => i.cmd));
+}
+
 async function cmdBackup(db, opts) {
   if (opts.show) {
     const d = backupMod.showDest(db);
@@ -306,8 +381,8 @@ const HELP = `ccs — Claude Code session 總覽
   ccs -a                   不限筆數（預設 30）
 
 欄位（-c 後面接編號，列到的才顯示；# 與 STATUS 固定顯示）：
-  1 = 閒置時間   2 = 完整路徑   3 = 路徑摘要   4 = 最後 prompt   5 = 內容摘要
-  預設 -c134。例：ccs -c1345、ccs -c35、ccs -c1234
+  1 = 閒置時間   2 = 完整路徑   3 = 路徑摘要   4 = 最後 prompt   5 = 內容摘要   6 = 名稱
+  預設 -c1634。例：ccs -c1345、ccs -c35、ccs -c1234
 
 排序（-s 後面接欄位編號，+ 正序 - 逆序，預設逆序）：
   ccs -s1      依時間，新到舊（等同 -s1-）
@@ -320,6 +395,16 @@ const HELP = `ccs — Claude Code session 總覽
   ccs sync                 只做增量掃描
   ccs sync --rescan        清掉快取重新全掃（改過分類規則後用）
   ccs resume <n>           印出該筆的 cd + claude --resume 指令
+
+  ccs snap [名稱]          存一份快照（目前開著哪些 session）；有名稱的永久保留
+  ccs snap --force <名稱>  覆蓋同名快照
+  ccs snap install         裝 launchd，每 5 分鐘自動存（沒變動不新增，保留 30 天）
+  ccs snap uninstall       移除自動快照
+  ccs snaps                列出所有快照
+  ccs snaps show [id|名稱] 看某份的細節（● 表示現在還開著）
+  ccs snaps rm <id|名稱>   刪除快照
+  ccs restore [id|名稱]    每個 session 開一個分頁 resume，已在執行的跳過（預設最近一筆）
+  ccs restore --dry-run    只印出會做什麼
 
   ccs backup gs://bucket/path/   備份 transcript 與資料庫到 GCS（會記住目的地）
   ccs backup                     用記住的目的地再備份一次
@@ -367,6 +452,7 @@ async function main() {
         sdk: { type: 'boolean', default: false },
         rescan: { type: 'boolean', default: false },
         show: { type: 'boolean', default: false },
+        force: { type: 'boolean', default: false },
       },
     });
   } catch (e) {
@@ -376,7 +462,8 @@ async function main() {
 
   const { values: v, positionals: pos } = parsed;
   const db = connect(v.db);
-  if (!v['no-sync'] && cmd !== 'sync') scan.sync(db);   // 增量，沒新東西幾乎不花時間
+  if (!v['no-sync'] && cmd !== 'sync' && !NO_SCAN.includes(cmd)) scan.sync(db);   // 增量，沒新東西幾乎不花時間
+  if (!NO_SCAN.includes(cmd)) scan.backfillNames(db);
 
   const opts = {
     pattern: cmd === 'resume' ? pos[1] : pos[0],
@@ -385,7 +472,7 @@ async function main() {
     cols: disp.cols ?? DEFAULT_COLS, sort: disp.sort,
     model: v.model, workers: Number(v.workers), verbose: v.verbose,
     dryRun: v['dry-run'], dbOnly: v['db-only'], show: v.show,
-    sdk: v.sdk, rescan: v.rescan,
+    sdk: v.sdk, rescan: v.rescan, pos, force: v.force,
   };
 
   try {
@@ -395,6 +482,9 @@ async function main() {
     else if (cmd === 'stats') cmdStats(db, opts);
     else if (cmd === 'resume') cmdResume(db, opts);
     else if (cmd === 'backup') await cmdBackup(db, opts);
+    else if (cmd === 'snap') cmdSnap(db, opts);
+    else if (cmd === 'snaps') cmdSnaps(db, opts);
+    else if (cmd === 'restore') cmdRestore(db, opts);
   } catch (e) {
     console.error(`\n${e.message}`);
     process.exit(1);

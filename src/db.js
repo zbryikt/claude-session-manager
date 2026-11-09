@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   n_user      INTEGER DEFAULT 0,
   n_assistant INTEGER DEFAULT 0,
   last_prompt TEXT,
-  kind        TEXT DEFAULT 'interactive'   -- interactive | sdk（claude -p 自己留下的）
+  kind        TEXT DEFAULT 'interactive',  -- interactive | sdk（claude -p 自己留下的）
+  name        TEXT               -- /rename 取的名字
 );
 
 -- 逐則 assistant 訊息的 token 用量；uuid 當主鍵讓重掃是冪等的
@@ -59,6 +60,23 @@ CREATE TABLE IF NOT EXISTS summaries (
   raw        TEXT,
   model      TEXT,
   created_at INTEGER
+);
+
+-- 快照：name 為 NULL 的是定時自動存的，有名稱的永久保留
+CREATE TABLE IF NOT EXISTS snapshots (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  name       TEXT UNIQUE,
+  created_at INTEGER NOT NULL,
+  last_seen  INTEGER NOT NULL    -- 內容沒變時只更新這個
+);
+
+CREATE TABLE IF NOT EXISTS snapshot_items (
+  snap_id INTEGER NOT NULL,
+  sid     TEXT NOT NULL,
+  name    TEXT,
+  cwd     TEXT NOT NULL,
+  kind    TEXT NOT NULL,         -- interactive | bg
+  PRIMARY KEY (snap_id, sid)
 );
 
 -- 設定，目前用來記住備份目的地
@@ -96,6 +114,9 @@ function migrate(db) {
   }
   if (!cols.includes('label')) {
     db.exec('ALTER TABLE sessions ADD COLUMN label TEXT');
+  }
+  if (!cols.includes('name')) {
+    db.exec('ALTER TABLE sessions ADD COLUMN name TEXT');
   }
 }
 
